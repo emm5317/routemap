@@ -44,7 +44,6 @@ import (
 func main() {
 	res, err := routemap.ExtractRoutes(context.Background(), routemap.Config{
 		ModuleDir:         ".",
-		PackagePattern:    "./...",
 		Frameworks:        []string{"gin", "chi", "nethttp"},
 		IncludeMiddleware: true,
 	})
