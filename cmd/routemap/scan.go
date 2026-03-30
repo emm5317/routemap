@@ -45,26 +45,7 @@ func init() {
 }
 
 func runScan(cmd *cobra.Command) {
-	cfg := routemap.Config{
-		ModuleDir:         globalModuleDir,
-		PackagePattern:    globalPackage,
-		IncludeMiddleware: scanMiddleware,
-	}
-
-	// Parse frameworks string into []string
-	if globalFrameworks != "" {
-		for _, f := range strings.Split(globalFrameworks, ",") {
-			f = strings.TrimSpace(f)
-			if f != "" {
-				cfg.Frameworks = append(cfg.Frameworks, f)
-			}
-		}
-	}
-
-	format := globalFormat
-	if scanJSON {
-		format = "json"
-	}
+	cfg, format := buildScanConfig()
 
 	res, err := routemap.ExtractRoutes(context.Background(), cfg)
 	if err != nil {
@@ -79,36 +60,60 @@ func runScan(cmd *cobra.Command) {
 	}
 
 	totalBefore := len(res.Routes)
+	filtered, activeFilters := applyRouteFilters(res.Routes)
+	res.Routes = filtered
+	sortRoutes(res.Routes, scanSortBy)
+	printOutput(res, format, totalBefore, activeFilters)
+	handleScanExit(len(res.Routes), res.Partial)
+}
 
-	// Apply method and path-prefix filters
-	activeFilters := []string{}
-	if scanMethod != "" || scanPathPrefix != "" {
-		filtered := res.Routes[:0]
-		for _, r := range res.Routes {
-			if scanMethod != "" && !strings.EqualFold(r.Method, scanMethod) {
-				continue
+func buildScanConfig() (routemap.Config, string) {
+	cfg := routemap.Config{
+		ModuleDir:         globalModuleDir,
+		PackagePattern:    globalPackage,
+		IncludeMiddleware: scanMiddleware,
+	}
+	if globalFrameworks != "" {
+		for _, f := range strings.Split(globalFrameworks, ",") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				cfg.Frameworks = append(cfg.Frameworks, f)
 			}
-			if scanPathPrefix != "" && !strings.HasPrefix(r.Path, scanPathPrefix) {
-				continue
-			}
-			filtered = append(filtered, r)
-		}
-		res.Routes = filtered
-		if scanMethod != "" {
-			activeFilters = append(activeFilters, "method="+scanMethod)
-		}
-		if scanPathPrefix != "" {
-			activeFilters = append(activeFilters, "path-prefix="+scanPathPrefix)
 		}
 	}
+	format := globalFormat
+	if scanJSON {
+		format = "json"
+	}
+	return cfg, format
+}
 
-	// Sort routes
-	sortRoutes(res.Routes, scanSortBy)
+func applyRouteFilters(routes []routemap.Route) ([]routemap.Route, []string) {
+	if scanMethod == "" && scanPathPrefix == "" {
+		return routes, nil
+	}
+	var activeFilters []string
+	filtered := routes[:0]
+	for _, r := range routes {
+		if scanMethod != "" && !strings.EqualFold(r.Method, scanMethod) {
+			continue
+		}
+		if scanPathPrefix != "" && !strings.HasPrefix(r.Path, scanPathPrefix) {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	if scanMethod != "" {
+		activeFilters = append(activeFilters, "method="+scanMethod)
+	}
+	if scanPathPrefix != "" {
+		activeFilters = append(activeFilters, "path-prefix="+scanPathPrefix)
+	}
+	return filtered, activeFilters
+}
 
-	printOutput(res, format, totalBefore, activeFilters)
-
-	// Exit code logic with narrative messages
-	if len(res.Routes) == 0 {
+func handleScanExit(routeCount int, partial bool) {
+	if routeCount == 0 {
 		if scanFailOnEmpty {
 			fmt.Fprintln(os.Stderr, "\nNo routes found. Failing because --fail-on-empty is set.")
 			os.Exit(1)
@@ -116,7 +121,7 @@ func runScan(cmd *cobra.Command) {
 		fmt.Fprintln(os.Stderr, "\nNo routes found. Check that the module directory and framework filters are correct.")
 		os.Exit(3)
 	}
-	if res.Partial {
+	if partial {
 		fmt.Fprintln(os.Stderr, "\nCompleted with warnings. Some routes may be incomplete — review diagnostics above.")
 		os.Exit(2)
 	}

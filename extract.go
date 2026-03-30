@@ -45,42 +45,9 @@ func ExtractRoutes(ctx context.Context, cfg Config) (RouteMap, error) {
 	allowed := frameworks.MakeAllowedSet(cfg.Frameworks)
 
 	for _, pkg := range pkgs {
-		// Report package-level errors as diagnostics.
-		for _, e := range pkg.Errors {
-			result.Diagnostics = append(result.Diagnostics, Diagnostic{
-				Severity: SeverityInfo,
-				Code:     "package-load-error",
-				Message:  e.Msg,
-			})
-		}
-
-		// Build package-scope function map for cross-file following.
-		pkgFuncMap := map[string]*ast.FuncDecl{}
-		for _, file := range pkg.Syntax {
-			fname := pkg.Fset.Position(file.Package).Filename
-			if strings.HasSuffix(fname, "_test.go") {
-				continue
-			}
-			for _, decl := range file.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok || fn.Body == nil || fn.Recv != nil {
-					continue
-				}
-				pkgFuncMap[fn.Name.Name] = fn
-			}
-		}
-
-		for _, file := range pkg.Syntax {
-			absFilename := pkg.Fset.Position(file.Package).Filename
-			// Skip test files that may leak in.
-			if strings.HasSuffix(absFilename, "_test.go") {
-				continue
-			}
-			relName := relativePath(absDir, absFilename)
-			routes, diags := extractFromAST(pkg.Fset, file, relName, absFilename, allowed, cfg.IncludeMiddleware, pkgFuncMap)
-			result.Routes = append(result.Routes, routes...)
-			result.Diagnostics = append(result.Diagnostics, diags...)
-		}
+		routes, diags := processPackage(pkg, absDir, allowed, cfg)
+		result.Routes = append(result.Routes, routes...)
+		result.Diagnostics = append(result.Diagnostics, diags...)
 	}
 
 	stableSortRoutes(result.Routes)
@@ -99,6 +66,49 @@ func ExtractRoutes(ctx context.Context, cfg Config) (RouteMap, error) {
 	return result, nil
 }
 
+// processPackage extracts routes from all non-test files in a single package.
+func processPackage(pkg *packages.Package, absDir string, allowed map[string]bool, cfg Config) ([]Route, []Diagnostic) {
+	var routes []Route
+	var diags []Diagnostic
+
+	for _, e := range pkg.Errors {
+		diags = append(diags, Diagnostic{Severity: SeverityInfo, Code: "package-load-error", Message: e.Msg})
+	}
+
+	pkgFuncMap := buildPkgFuncMap(pkg)
+
+	for _, file := range pkg.Syntax {
+		absFilename := pkg.Fset.Position(file.Package).Filename
+		if strings.HasSuffix(absFilename, "_test.go") {
+			continue
+		}
+		relName := relativePath(absDir, absFilename)
+		r, d := extractFromAST(pkg.Fset, file, relName, absFilename, allowed, cfg.IncludeMiddleware, pkgFuncMap)
+		routes = append(routes, r...)
+		diags = append(diags, d...)
+	}
+	return routes, diags
+}
+
+// buildPkgFuncMap builds a cross-file function map from all non-test files in a package.
+func buildPkgFuncMap(pkg *packages.Package) map[string]*ast.FuncDecl {
+	m := map[string]*ast.FuncDecl{}
+	for _, file := range pkg.Syntax {
+		fname := pkg.Fset.Position(file.Package).Filename
+		if strings.HasSuffix(fname, "_test.go") {
+			continue
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || fn.Recv != nil {
+				continue
+			}
+			m[fn.Name.Name] = fn
+		}
+	}
+	return m
+}
+
 // relativePath returns path relative to base, or the original path if that fails.
 func relativePath(base, path string) string {
 	rel, err := filepath.Rel(base, path)
@@ -109,51 +119,58 @@ func relativePath(base, path string) string {
 }
 
 // extractFromAST extracts routes from a pre-parsed AST file.
-func extractFromAST(fset *token.FileSet, file *ast.File, filename, absFilename string, allowed map[string]bool, includeMiddleware bool, pkgFuncMap map[string]*ast.FuncDecl) ([]Route, []Diagnostic) {
-	aliases := parseImportAliases(file)
-	sfm := analysis.ScanStructFieldRouters(file, aliases)
-	consts := analysis.CollectConstants(file)
-	var routes []Route
-	var diags []Diagnostic
-
-	// Build a map of all free function declarations in this file for intra-file following.
-	funcMap := map[string]*ast.FuncDecl{}
+// buildFileFuncMap builds a per-file function map and merges the package-scope map.
+func buildFileFuncMap(file *ast.File, pkgFuncMap map[string]*ast.FuncDecl) map[string]*ast.FuncDecl {
+	m := map[string]*ast.FuncDecl{}
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil || fn.Recv != nil {
 			continue
 		}
-		funcMap[fn.Name.Name] = fn
+		m[fn.Name.Name] = fn
 	}
-
-	// Merge package-scope functions (cross-file); per-file takes precedence.
 	for name, fn := range pkgFuncMap {
-		if _, exists := funcMap[name]; !exists {
-			funcMap[name] = fn
+		if _, exists := m[name]; !exists {
+			m[name] = fn
 		}
 	}
+	return m
+}
+
+// seedReceiverEnv creates an env map seeded with struct-field router contexts for method receivers.
+func seedReceiverEnv(fn *ast.FuncDecl, sfm map[string]analysis.RouterContext) map[string]analysis.RouterContext {
+	env := map[string]analysis.RouterContext{}
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return env
+	}
+	recvName, recvType := analysis.ParseReceiver(fn.Recv.List[0])
+	if recvName == "" || recvType == "" {
+		return env
+	}
+	for sfKey, ctx := range sfm {
+		parts := strings.SplitN(sfKey, ".", 2)
+		if len(parts) == 2 && parts[0] == recvType {
+			ctx.Inferred = true
+			env[recvName+"."+parts[1]] = ctx
+		}
+	}
+	return env
+}
+
+func extractFromAST(fset *token.FileSet, file *ast.File, filename, absFilename string, allowed map[string]bool, includeMiddleware bool, pkgFuncMap map[string]*ast.FuncDecl) ([]Route, []Diagnostic) {
+	aliases := parseImportAliases(file)
+	sfm := analysis.ScanStructFieldRouters(file, aliases)
+	consts := analysis.CollectConstants(file)
+	funcMap := buildFileFuncMap(file, pkgFuncMap)
+	var routes []Route
+	var diags []Diagnostic
 
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil {
 			continue
 		}
-		env := map[string]analysis.RouterContext{}
-
-		// Seed method receiver env from struct field tracking.
-		if fn.Recv != nil && len(fn.Recv.List) > 0 {
-			recvName, recvType := analysis.ParseReceiver(fn.Recv.List[0])
-			if recvName != "" && recvType != "" {
-				for sfKey, ctx := range sfm {
-					parts := strings.SplitN(sfKey, ".", 2)
-					if len(parts) == 2 && parts[0] == recvType {
-						ctx.Inferred = true
-						env[recvName+"."+parts[1]] = ctx
-					}
-				}
-			}
-		}
-
+		env := seedReceiverEnv(fn, sfm)
 		routes = append(routes, walkBlock(fset, filename, absFilename, fn.Body, env, aliases, consts, allowed, includeMiddleware, &diags, funcMap, 0)...)
 	}
 
@@ -174,87 +191,110 @@ func extractFromAST(fset *token.FileSet, file *ast.File, filename, absFilename s
 }
 
 func walkBlock(
-	fset *token.FileSet,
-	filename string,
-	absFilename string,
-	block *ast.BlockStmt,
-	env map[string]analysis.RouterContext,
-	aliases map[string]string,
-	consts map[string]string,
-	allowed map[string]bool,
-	includeMiddleware bool,
-	diags *[]Diagnostic,
-	funcMap map[string]*ast.FuncDecl,
-	depth int,
+	fset *token.FileSet, filename, absFilename string, block *ast.BlockStmt,
+	env map[string]analysis.RouterContext, aliases, consts map[string]string,
+	allowed map[string]bool, includeMiddleware bool, diags *[]Diagnostic,
+	funcMap map[string]*ast.FuncDecl, depth int,
 ) []Route {
 	var routes []Route
 	for _, stmt := range block.List {
-		switch s := stmt.(type) {
-		case *ast.AssignStmt:
-			handleAssignment(env, s, aliases)
-		case *ast.DeclStmt:
-			handleDeclStmt(env, s, aliases)
-		case *ast.ExprStmt:
-			call, ok := s.X.(*ast.CallExpr)
+		// Unwrap labeled statements before dispatching.
+		for {
+			ls, ok := stmt.(*ast.LabeledStmt)
 			if !ok {
-				continue
+				break
 			}
-			routes = append(routes, handleCall(fset, filename, absFilename, call, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)...)
-		case *ast.IfStmt:
-			routes = append(routes, markConditional(walkBlock(fset, filename, absFilename, s.Body, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth))...)
-			if s.Else != nil {
-				routes = append(routes, markConditional(walkElse(fset, filename, absFilename, s.Else, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth))...)
-			}
-		case *ast.ForStmt:
-			if s.Body != nil {
-				routes = append(routes, walkBlock(fset, filename, absFilename, s.Body, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)...)
-			}
-		case *ast.RangeStmt:
-			if s.Body != nil {
-				routes = append(routes, walkBlock(fset, filename, absFilename, s.Body, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)...)
-			}
-		case *ast.SwitchStmt:
-			if s.Body != nil {
-				for _, clause := range s.Body.List {
-					cc, ok := clause.(*ast.CaseClause)
-					if !ok {
-						continue
-					}
-					routes = append(routes, markConditional(walkBlock(fset, filename, absFilename, &ast.BlockStmt{List: cc.Body}, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth))...)
-				}
-			}
-		case *ast.TypeSwitchStmt:
-			if s.Body != nil {
-				for _, clause := range s.Body.List {
-					cc, ok := clause.(*ast.CaseClause)
-					if !ok {
-						continue
-					}
-					routes = append(routes, markConditional(walkBlock(fset, filename, absFilename, &ast.BlockStmt{List: cc.Body}, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth))...)
-				}
-			}
-		case *ast.GoStmt:
-			if s.Call != nil {
-				routes = append(routes, handleCall(fset, filename, absFilename, s.Call, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)...)
-			}
-		case *ast.DeferStmt:
-			if s.Call != nil {
-				routes = append(routes, handleCall(fset, filename, absFilename, s.Call, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)...)
-			}
-		case *ast.SelectStmt:
-			if s.Body != nil {
-				for _, clause := range s.Body.List {
-					cc, ok := clause.(*ast.CommClause)
-					if !ok {
-						continue
-					}
-					routes = append(routes, walkBlock(fset, filename, absFilename, &ast.BlockStmt{List: cc.Body}, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)...)
-				}
-			}
-		case *ast.LabeledStmt:
-			// Unwrap the labeled statement and process the inner statement.
-			routes = append(routes, walkBlock(fset, filename, absFilename, &ast.BlockStmt{List: []ast.Stmt{s.Stmt}}, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)...)
+			stmt = ls.Stmt
 		}
+		routes = append(routes, walkStmt(fset, filename, absFilename, stmt, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)...)
+	}
+	return routes
+}
+
+func walkStmt(
+	fset *token.FileSet, filename, absFilename string, stmt ast.Stmt,
+	env map[string]analysis.RouterContext, aliases, consts map[string]string,
+	allowed map[string]bool, includeMiddleware bool, diags *[]Diagnostic,
+	funcMap map[string]*ast.FuncDecl, depth int,
+) []Route {
+	switch s := stmt.(type) {
+	case *ast.AssignStmt:
+		handleAssignment(env, s, aliases)
+	case *ast.DeclStmt:
+		handleDeclStmt(env, s, aliases)
+	case *ast.ExprStmt:
+		if call, ok := s.X.(*ast.CallExpr); ok {
+			return handleCall(fset, filename, absFilename, call, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
+		}
+	case *ast.IfStmt:
+		routes := markConditional(walkBlock(fset, filename, absFilename, s.Body, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth))
+		if s.Else != nil {
+			routes = append(routes, markConditional(walkElse(fset, filename, absFilename, s.Else, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth))...)
+		}
+		return routes
+	case *ast.ForStmt, *ast.RangeStmt:
+		if body := stmtBody(s); body != nil {
+			return walkBlock(fset, filename, absFilename, body, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
+		}
+	case *ast.SwitchStmt, *ast.TypeSwitchStmt:
+		if body := stmtBody(s); body != nil {
+			return walkCaseClauses(fset, filename, absFilename, body.List, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
+		}
+	case *ast.GoStmt:
+		return handleCall(fset, filename, absFilename, s.Call, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
+	case *ast.DeferStmt:
+		return handleCall(fset, filename, absFilename, s.Call, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
+	case *ast.SelectStmt:
+		if s.Body != nil {
+			return walkCommClauses(fset, filename, absFilename, s.Body.List, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
+		}
+	}
+	return nil
+}
+
+// stmtBody extracts the Body field from for/range/switch/type-switch statements.
+func stmtBody(stmt ast.Stmt) *ast.BlockStmt {
+	switch s := stmt.(type) {
+	case *ast.ForStmt:
+		return s.Body
+	case *ast.RangeStmt:
+		return s.Body
+	case *ast.SwitchStmt:
+		return s.Body
+	case *ast.TypeSwitchStmt:
+		return s.Body
+	}
+	return nil
+}
+
+// walkCaseClauses iterates switch/type-switch case clauses and walks each body as conditional.
+func walkCaseClauses(fset *token.FileSet, filename, absFilename string, clauses []ast.Stmt,
+	env map[string]analysis.RouterContext, aliases, consts map[string]string, allowed map[string]bool,
+	includeMiddleware bool, diags *[]Diagnostic, funcMap map[string]*ast.FuncDecl, depth int,
+) []Route {
+	var routes []Route
+	for _, clause := range clauses {
+		cc, ok := clause.(*ast.CaseClause)
+		if !ok {
+			continue
+		}
+		routes = append(routes, markConditional(walkBlock(fset, filename, absFilename, &ast.BlockStmt{List: cc.Body}, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth))...)
+	}
+	return routes
+}
+
+// walkCommClauses iterates select statement comm clauses and walks each body.
+func walkCommClauses(fset *token.FileSet, filename, absFilename string, clauses []ast.Stmt,
+	env map[string]analysis.RouterContext, aliases, consts map[string]string, allowed map[string]bool,
+	includeMiddleware bool, diags *[]Diagnostic, funcMap map[string]*ast.FuncDecl, depth int,
+) []Route {
+	var routes []Route
+	for _, clause := range clauses {
+		cc, ok := clause.(*ast.CommClause)
+		if !ok {
+			continue
+		}
+		routes = append(routes, walkBlock(fset, filename, absFilename, &ast.BlockStmt{List: cc.Body}, cloneEnv(env), aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)...)
 	}
 	return routes
 }
@@ -389,87 +429,81 @@ func handleCall(
 
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
-		// Try to follow plain function calls that pass a known router.
-		if depth < 3 {
-			if ident, ok := call.Fun.(*ast.Ident); ok {
-				if callee, ok := funcMap[ident.Name]; ok {
-					for i, arg := range call.Args {
-						if key, ok := analysis.ResolveRouterKey(arg); ok {
-							if ctx, ok := env[key]; ok {
-								if i < len(callee.Type.Params.List) {
-									paramNames := callee.Type.Params.List[i].Names
-									if len(paramNames) > 0 {
-										childEnv := cloneEnv(env)
-										childEnv[paramNames[0].Name] = ctx
-										calleeAbsFile := fset.Position(callee.Pos()).Filename
-										crossFile := calleeAbsFile != absFilename
-										walkFilename := filename
-										walkAbsFilename := absFilename
-										if crossFile {
-											pkgDir := filepath.Dir(absFilename)
-											walkAbsFilename = calleeAbsFile
-											walkFilename = relativePath(pkgDir, calleeAbsFile)
-										}
-										inner := walkBlock(fset, walkFilename, walkAbsFilename, callee.Body, childEnv, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth+1)
-										if crossFile {
-											for j := range inner {
-												if inner[j].Confidence == ConfidenceExact {
-													inner[j].Confidence = ConfidenceInferred
-													inner[j].InferredBy = "cross-file"
-												}
-											}
-										}
-										return inner
-									}
-								}
-							}
-						}
-					}
+		return followFuncCall(fset, filename, absFilename, call, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
+	}
+
+	return handleSelectorCall(fset, filename, absFilename, call, sel, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
+}
+
+// followFuncCall attempts to follow plain function calls (e.g., setupRoutes(r))
+// into callee bodies when a known router is passed as an argument.
+func followFuncCall(
+	fset *token.FileSet, filename, absFilename string, call *ast.CallExpr,
+	env map[string]analysis.RouterContext, aliases, consts map[string]string,
+	allowed map[string]bool, includeMiddleware bool, diags *[]Diagnostic,
+	funcMap map[string]*ast.FuncDecl, depth int,
+) []Route {
+	if depth >= 3 {
+		return nil
+	}
+	ident, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	callee, ok := funcMap[ident.Name]
+	if !ok {
+		return nil
+	}
+	for i, arg := range call.Args {
+		key, ok := analysis.ResolveRouterKey(arg)
+		if !ok {
+			continue
+		}
+		ctx, ok := env[key]
+		if !ok || i >= len(callee.Type.Params.List) {
+			continue
+		}
+		paramNames := callee.Type.Params.List[i].Names
+		if len(paramNames) == 0 {
+			continue
+		}
+		childEnv := cloneEnv(env)
+		childEnv[paramNames[0].Name] = ctx
+		calleeAbsFile := fset.Position(callee.Pos()).Filename
+		crossFile := calleeAbsFile != absFilename
+		walkFilename, walkAbsFilename := filename, absFilename
+		if crossFile {
+			walkAbsFilename = calleeAbsFile
+			walkFilename = relativePath(filepath.Dir(absFilename), calleeAbsFile)
+		}
+		inner := walkBlock(fset, walkFilename, walkAbsFilename, callee.Body, childEnv, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth+1)
+		if crossFile {
+			for j := range inner {
+				if inner[j].Confidence != ConfidenceInferred {
+					inner[j].Confidence = ConfidenceInferred
+					inner[j].InferredBy = "cross-file"
 				}
 			}
 		}
-		return nil
+		return inner
 	}
+	return nil
+}
 
+// handleSelectorCall handles method calls on router objects (r.GET, r.Use, r.Route, etc.).
+func handleSelectorCall(
+	fset *token.FileSet, filename, absFilename string, call *ast.CallExpr, sel *ast.SelectorExpr,
+	env map[string]analysis.RouterContext, aliases, consts map[string]string,
+	allowed map[string]bool, includeMiddleware bool, diags *[]Diagnostic,
+	funcMap map[string]*ast.FuncDecl, depth int,
+) []Route {
 	method := sel.Sel.Name
 	lowerMethod := strings.ToLower(method)
 
-	if key, ok := analysis.ResolveRouterKey(sel.X); ok {
-		ctx, ok := env[key]
-		if !ok {
-			return nil
-		}
-		if !frameworks.AllowedFramework(ctx.Framework, allowed) {
-			return nil
-		}
-
-		if lowerMethod == "use" {
-			for _, arg := range call.Args {
-				ctx.Middleware = append(ctx.Middleware, analysis.ExprString(arg))
-			}
-			env[key] = ctx
-			return nil
-		}
-
-		if routeMethod := frameworks.RouteMethodForFramework(ctx.Framework, method, call.Args); routeMethod != "" {
-			r, ok := buildRoute(fset, filename, call, ctx, routeMethod, consts, includeMiddleware)
-			if ok {
-				return []Route{r}
-			}
-			*diags = append(*diags, Diagnostic{Severity: SeverityWarning, Code: "unparseable-route", Message: "unable to parse route call", File: filename, Line: fset.Position(call.Pos()).Line})
-			return nil
-		}
-
-		if ctx.Framework == "chi" && lowerMethod == "route" && len(call.Args) >= 2 {
-			prefix := analysis.ReadStringArgWithConsts(call.Args[0], consts)
-			next := ctx
-			next.Prefix = analysis.JoinPath(ctx.Prefix, prefix)
-			if fn, ok := call.Args[1].(*ast.FuncLit); ok && len(fn.Type.Params.List) > 0 && len(fn.Type.Params.List[0].Names) > 0 {
-				childName := fn.Type.Params.List[0].Names[0].Name
-				childEnv := cloneEnv(env)
-				childEnv[childName] = next
-				return walkBlock(fset, filename, absFilename, fn.Body, childEnv, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
-			}
+	key, ok := analysis.ResolveRouterKey(sel.X)
+	if ok {
+		if routes := dispatchRouterMethod(fset, filename, absFilename, call, key, method, lowerMethod, env, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth); routes != nil {
+			return routes
 		}
 	}
 
@@ -477,6 +511,51 @@ func handleCall(
 		r, ok := buildGlobalNetHTTPRoute(fset, filename, call, consts, includeMiddleware)
 		if ok {
 			return []Route{r}
+		}
+	}
+
+	return nil
+}
+
+// dispatchRouterMethod handles .Use(), route methods, and chi .Route() on a known router.
+// Returns nil (not empty slice) if the method is not a recognized router operation.
+func dispatchRouterMethod(
+	fset *token.FileSet, filename, absFilename string, call *ast.CallExpr,
+	key, method, lowerMethod string,
+	env map[string]analysis.RouterContext, aliases, consts map[string]string,
+	allowed map[string]bool, includeMiddleware bool, diags *[]Diagnostic,
+	funcMap map[string]*ast.FuncDecl, depth int,
+) []Route {
+	ctx, ok := env[key]
+	if !ok || !frameworks.AllowedFramework(ctx.Framework, allowed) {
+		return nil
+	}
+
+	if lowerMethod == "use" {
+		for _, arg := range call.Args {
+			ctx.Middleware = append(ctx.Middleware, analysis.ExprString(arg))
+		}
+		env[key] = ctx
+		return []Route{}
+	}
+
+	if routeMethod := frameworks.RouteMethodForFramework(ctx.Framework, method, call.Args); routeMethod != "" {
+		r, ok := buildRoute(fset, filename, call, ctx, routeMethod, consts, includeMiddleware)
+		if ok {
+			return []Route{r}
+		}
+		*diags = append(*diags, Diagnostic{Severity: SeverityWarning, Code: "unparseable-route", Message: "unable to parse route call", File: filename, Line: fset.Position(call.Pos()).Line})
+		return []Route{}
+	}
+
+	if ctx.Framework == "chi" && lowerMethod == "route" && len(call.Args) >= 2 {
+		prefix := analysis.ReadStringArgWithConsts(call.Args[0], consts)
+		next := ctx
+		next.Prefix = analysis.JoinPath(ctx.Prefix, prefix)
+		if fn, ok := call.Args[1].(*ast.FuncLit); ok && len(fn.Type.Params.List) > 0 && len(fn.Type.Params.List[0].Names) > 0 {
+			childEnv := cloneEnv(env)
+			childEnv[fn.Type.Params.List[0].Names[0].Name] = next
+			return walkBlock(fset, filename, absFilename, fn.Body, childEnv, aliases, consts, allowed, includeMiddleware, diags, funcMap, depth)
 		}
 	}
 
@@ -497,7 +576,7 @@ func buildRoute(fset *token.FileSet, filename string, call *ast.CallExpr, ctx an
 	confidence := ConfidenceExact
 	inferredBy := ""
 	if ctx.Inferred {
-		confidence = ConfidenceInferred
+		confidence = ConfidenceHigh
 		inferredBy = "struct-field"
 	}
 	r := Route{

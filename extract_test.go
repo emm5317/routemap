@@ -67,8 +67,8 @@ func TestExtractRoutes(t *testing.T) {
 			frameworks: []string{"fiber"},
 			wantCount:  2,
 			wantRoutes: []expectedRoute{
-				{Method: "GET", Path: "/", Framework: "fiber", Confidence: routemap.ConfidenceInferred},
-				{Method: "POST", Path: "/bets/:id/settle", Framework: "fiber", Confidence: routemap.ConfidenceInferred},
+				{Method: "GET", Path: "/", Framework: "fiber", Confidence: routemap.ConfidenceHigh},
+				{Method: "POST", Path: "/bets/:id/settle", Framework: "fiber", Confidence: routemap.ConfidenceHigh},
 			},
 		},
 		{
@@ -186,35 +186,11 @@ func TestExtractRoutes(t *testing.T) {
 				if i >= len(res.Routes) {
 					break
 				}
-				got := res.Routes[i]
-				if got.Method != want.Method {
-					t.Errorf("route[%d] method: got %q want %q", i, got.Method, want.Method)
-				}
-				if got.Path != want.Path {
-					t.Errorf("route[%d] path: got %q want %q", i, got.Path, want.Path)
-				}
-				if got.Framework != want.Framework {
-					t.Errorf("route[%d] framework: got %q want %q", i, got.Framework, want.Framework)
-				}
-				if got.Confidence != want.Confidence {
-					t.Errorf("route[%d] confidence: got %q want %q", i, got.Confidence, want.Confidence)
-				}
-				if got.Conditional != want.Conditional {
-					t.Errorf("route[%d] conditional: got %v want %v", i, got.Conditional, want.Conditional)
-				}
+				assertRoute(t, i, res.Routes[i], want)
 			}
 
 			for _, wantDiag := range tt.wantDiags {
-				found := false
-				for _, d := range res.Diagnostics {
-					if d.Code == wantDiag.Code && d.Severity == wantDiag.Severity {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Errorf("expected diagnostic code=%q severity=%q, got %v", wantDiag.Code, wantDiag.Severity, res.Diagnostics)
-				}
+				assertDiagnostic(t, res.Diagnostics, wantDiag)
 			}
 
 			if res.Partial != tt.wantPartial {
@@ -277,6 +253,35 @@ func TestExtractRoutes_EchoMiddlewareOrder(t *testing.T) {
 			t.Errorf("middleware[%d]: got %q want %q", i, apiRoute.Middleware[i].Name, want[i])
 		}
 	}
+}
+
+func assertRoute(t *testing.T, i int, got routemap.Route, want expectedRoute) {
+	t.Helper()
+	if got.Method != want.Method {
+		t.Errorf("route[%d] method: got %q want %q", i, got.Method, want.Method)
+	}
+	if got.Path != want.Path {
+		t.Errorf("route[%d] path: got %q want %q", i, got.Path, want.Path)
+	}
+	if got.Framework != want.Framework {
+		t.Errorf("route[%d] framework: got %q want %q", i, got.Framework, want.Framework)
+	}
+	if got.Confidence != want.Confidence {
+		t.Errorf("route[%d] confidence: got %q want %q", i, got.Confidence, want.Confidence)
+	}
+	if got.Conditional != want.Conditional {
+		t.Errorf("route[%d] conditional: got %v want %v", i, got.Conditional, want.Conditional)
+	}
+}
+
+func assertDiagnostic(t *testing.T, diags []routemap.Diagnostic, want expectedDiag) {
+	t.Helper()
+	for _, d := range diags {
+		if d.Code == want.Code && d.Severity == want.Severity {
+			return
+		}
+	}
+	t.Errorf("expected diagnostic code=%q severity=%q, got %v", want.Code, want.Severity, diags)
 }
 
 func fixtureDir(t *testing.T, name string) string {

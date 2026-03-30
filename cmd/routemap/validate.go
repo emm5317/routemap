@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
-
 	"github.com/emm5317/routemap"
 	"github.com/spf13/cobra"
 )
@@ -39,60 +37,14 @@ type validateResult struct {
 }
 
 func runValidate() {
-	cfg := routemap.Config{
-		ModuleDir:         globalModuleDir,
-		PackagePattern:    globalPackage,
-		IncludeMiddleware: scanMiddleware,
-	}
-
-	if globalFrameworks != "" {
-		for _, f := range strings.Split(globalFrameworks, ",") {
-			f = strings.TrimSpace(f)
-			if f != "" {
-				cfg.Frameworks = append(cfg.Frameworks, f)
-			}
-		}
-	}
-
+	cfg, _ := buildScanConfig()
 	res, err := routemap.ExtractRoutes(context.Background(), cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	vr := validateResult{
-		Pass:       true,
-		RouteCount: len(res.Routes),
-	}
-
-	// Check require-routes
-	if validateRequireRoutes && len(res.Routes) == 0 {
-		vr.Failures = append(vr.Failures, "no routes found (--require-routes)")
-		vr.Pass = false
-	}
-
-	// Check min-routes
-	if validateMinRoutes > 0 && len(res.Routes) < validateMinRoutes {
-		vr.Failures = append(vr.Failures,
-			fmt.Sprintf("found %d routes, minimum required is %d (--min-routes)", len(res.Routes), validateMinRoutes))
-		vr.Pass = false
-	}
-
-	// Check no-duplicates
-	if validateNoDuplicates {
-		seen := map[string]int{}
-		for _, r := range res.Routes {
-			key := r.Method + " " + r.Path
-			seen[key]++
-		}
-		for key, count := range seen {
-			if count > 1 {
-				vr.Failures = append(vr.Failures,
-					fmt.Sprintf("duplicate route: %s (appears %d times)", key, count))
-				vr.Pass = false
-			}
-		}
-	}
+	vr := runValidationChecks(res)
 
 	switch globalFormat {
 	case "json":
@@ -115,5 +67,36 @@ func runValidate() {
 
 	if !vr.Pass {
 		os.Exit(1)
+	}
+}
+
+func runValidationChecks(res routemap.RouteMap) validateResult {
+	vr := validateResult{Pass: true, RouteCount: len(res.Routes)}
+
+	if validateRequireRoutes && len(res.Routes) == 0 {
+		vr.Failures = append(vr.Failures, "no routes found (--require-routes)")
+		vr.Pass = false
+	}
+	if validateMinRoutes > 0 && len(res.Routes) < validateMinRoutes {
+		vr.Failures = append(vr.Failures,
+			fmt.Sprintf("found %d routes, minimum required is %d (--min-routes)", len(res.Routes), validateMinRoutes))
+		vr.Pass = false
+	}
+	if validateNoDuplicates {
+		checkDuplicateRoutes(&vr, res.Routes)
+	}
+	return vr
+}
+
+func checkDuplicateRoutes(vr *validateResult, routes []routemap.Route) {
+	seen := map[string]int{}
+	for _, r := range routes {
+		seen[r.Method+" "+r.Path]++
+	}
+	for key, count := range seen {
+		if count > 1 {
+			vr.Failures = append(vr.Failures, fmt.Sprintf("duplicate route: %s (appears %d times)", key, count))
+			vr.Pass = false
+		}
 	}
 }

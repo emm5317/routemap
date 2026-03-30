@@ -10,9 +10,14 @@ import (
 type Confidence string
 
 const (
-	// ConfidenceExact means the route was fully tracked from constructor to route call.
+	// ConfidenceExact means the route was fully tracked from constructor to route call
+	// within the same function scope.
 	ConfidenceExact Confidence = "exact"
-	// ConfidenceInferred means the router identity was resolved via struct-field propagation or heuristic.
+	// ConfidenceHigh means the router identity was resolved via struct-field propagation
+	// within the same file. The constructor was found deterministically.
+	ConfidenceHigh Confidence = "high"
+	// ConfidenceInferred means the router identity was resolved via cross-file tracking
+	// where there is genuine ambiguity about the router's origin.
 	ConfidenceInferred Confidence = "inferred"
 )
 

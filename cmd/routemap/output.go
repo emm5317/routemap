@@ -26,9 +26,12 @@ func printOutput(res routemap.RouteMap, format string, totalBefore int, filters 
 func printText(res routemap.RouteMap) {
 	for _, r := range res.Routes {
 		confidence := ""
-		if r.Confidence == routemap.ConfidenceExact {
+		switch r.Confidence {
+		case routemap.ConfidenceExact:
 			confidence = " [exact]"
-		} else if r.Confidence == routemap.ConfidenceInferred {
+		case routemap.ConfidenceHigh:
+			confidence = " [high]"
+		case routemap.ConfidenceInferred:
 			suffix := "inferred"
 			if r.InferredBy != "" {
 				suffix = "inferred:" + r.InferredBy

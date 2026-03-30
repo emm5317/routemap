@@ -169,9 +169,10 @@ func AllowedFramework(framework string, allowed map[string]bool) bool {
 	return allowed[framework]
 }
 
-// HasRoutelikeCalls returns true if the file contains method calls that look
-// like route registrations or router constructors. Used to suppress noisy
-// diagnostics on files that only import a framework for types.
+// HasRoutelikeCalls returns true if the file contains calls that look like
+// actual route registrations: method calls with a string literal first argument
+// (the path). This filters out files that only import a framework for types
+// (e.g., handler files that use fiber.Ctx but don't register routes).
 func HasRoutelikeCalls(file *ast.File) bool {
 	routeMethods := map[string]bool{
 		"Get": true, "Post": true, "Put": true, "Delete": true, "Patch": true,
@@ -179,7 +180,10 @@ func HasRoutelikeCalls(file *ast.File) bool {
 		"Handle": true, "HandleFunc": true, "Group": true, "Route": true,
 		"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
 		"HEAD": true, "OPTIONS": true,
-		"New": true, "Default": true, "NewRouter": true, "NewServeMux": true,
+	}
+	// Framework package names that have constructors.
+	frameworkPkgs := map[string]bool{
+		"chi": true, "gin": true, "echo": true, "fiber": true, "http": true,
 	}
 	found := false
 	ast.Inspect(file, func(n ast.Node) bool {
@@ -190,8 +194,21 @@ func HasRoutelikeCalls(file *ast.File) bool {
 		if !ok {
 			return true
 		}
-		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-			if routeMethods[sel.Sel.Name] {
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		// Constructors: only match when called on a known framework package.
+		if pkg, ok := sel.X.(*ast.Ident); ok && frameworkPkgs[pkg.Name] {
+			name := sel.Sel.Name
+			if name == "New" || name == "Default" || name == "NewRouter" || name == "NewServeMux" {
+				found = true
+				return false
+			}
+		}
+		// Route methods require at least 2 args with a string literal first arg (the path).
+		if routeMethods[sel.Sel.Name] && len(call.Args) >= 2 {
+			if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
 				found = true
 				return false
 			}

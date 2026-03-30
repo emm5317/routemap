@@ -51,52 +51,56 @@ func ScanStructFieldRouters(file *ast.File, aliases map[string]string) map[strin
 func scanStmtForFieldRouters(stmt ast.Stmt, localEnv map[string]RouterContext, aliases map[string]string, sfm map[string]RouterContext, returnType string) {
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
-		if len(s.Lhs) != len(s.Rhs) {
-			return
-		}
-		for i := range s.Lhs {
-			rhs := s.Rhs[i]
-			// Track local router variables.
-			if id, ok := s.Lhs[i].(*ast.Ident); ok && id.Name != "_" {
-				if ctx, ok := deriveConstructorOrAlias(rhs, localEnv, aliases); ok {
-					localEnv[id.Name] = ctx
-				}
-				// Check composite literal assignments: instance := &App{app: localRouter}
-				scanCompositeLiteral(rhs, localEnv, aliases, sfm)
-			}
-			// Track field assignments: s.field = fiber.New() or s.field = localRouter
-			if sel, ok := s.Lhs[i].(*ast.SelectorExpr); ok {
-				if base, ok := sel.X.(*ast.Ident); ok {
-					if ctx, ok := deriveConstructorOrAlias(rhs, localEnv, aliases); ok {
-						// Try to determine type name from return type or receiver.
-						typeName := returnType
-						if typeName == "" {
-							typeName = base.Name // fallback
-						}
-						sfm[typeName+"."+sel.Sel.Name] = ctx
-					}
-				}
-			}
-		}
+		scanAssignForFieldRouters(s, localEnv, aliases, sfm, returnType)
 	case *ast.DeclStmt:
-		gen, ok := s.Decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.VAR {
-			return
+		scanDeclForFieldRouters(s, localEnv, aliases, sfm)
+	}
+}
+
+func scanAssignForFieldRouters(s *ast.AssignStmt, localEnv map[string]RouterContext, aliases map[string]string, sfm map[string]RouterContext, returnType string) {
+	if len(s.Lhs) != len(s.Rhs) {
+		return
+	}
+	for i := range s.Lhs {
+		rhs := s.Rhs[i]
+		if id, ok := s.Lhs[i].(*ast.Ident); ok && id.Name != "_" {
+			if ctx, ok := deriveConstructorOrAlias(rhs, localEnv, aliases); ok {
+				localEnv[id.Name] = ctx
+			}
+			scanCompositeLiteral(rhs, localEnv, aliases, sfm)
 		}
-		for _, spec := range gen.Specs {
-			vs, ok := spec.(*ast.ValueSpec)
-			if !ok {
+		if sel, ok := s.Lhs[i].(*ast.SelectorExpr); ok {
+			if base, ok := sel.X.(*ast.Ident); ok {
+				if ctx, ok := deriveConstructorOrAlias(rhs, localEnv, aliases); ok {
+					typeName := returnType
+					if typeName == "" {
+						typeName = base.Name
+					}
+					sfm[typeName+"."+sel.Sel.Name] = ctx
+				}
+			}
+		}
+	}
+}
+
+func scanDeclForFieldRouters(s *ast.DeclStmt, localEnv map[string]RouterContext, aliases map[string]string, sfm map[string]RouterContext) {
+	gen, ok := s.Decl.(*ast.GenDecl)
+	if !ok || gen.Tok != token.VAR {
+		return
+	}
+	for _, spec := range gen.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		for i, name := range vs.Names {
+			if i >= len(vs.Values) {
 				continue
 			}
-			for i, name := range vs.Names {
-				if i >= len(vs.Values) {
-					continue
-				}
-				if ctx, ok := deriveConstructorOrAlias(vs.Values[i], localEnv, aliases); ok {
-					localEnv[name.Name] = ctx
-				}
-				scanCompositeLiteral(vs.Values[i], localEnv, aliases, sfm)
+			if ctx, ok := deriveConstructorOrAlias(vs.Values[i], localEnv, aliases); ok {
+				localEnv[name.Name] = ctx
 			}
+			scanCompositeLiteral(vs.Values[i], localEnv, aliases, sfm)
 		}
 	}
 }
