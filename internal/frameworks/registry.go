@@ -18,6 +18,11 @@ var registry = []Adapter{
 	&nethttpAdapter{},
 }
 
+// AllAdapters returns all registered framework adapters.
+func AllAdapters() []Adapter {
+	return registry
+}
+
 // GetAdapter returns the Adapter for the given framework name, or (nil, false)
 // if the framework is not registered.
 func GetAdapter(name string) (Adapter, bool) {
